@@ -1,100 +1,59 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"fmt"
-	"io"
+	"golang.org/x/sys/unix"
 	"os"
-	"snake-game/snake"
-	"strings"
-	"unicode"
+	"os/exec"
+	"strconv"
 )
 
-type ConsoleGame struct {
-	isDone chan struct{}
-	errs   chan error
-	game   *snake.Game //todo interface
-	//todo listen terminal size changes
+func TerminalSizes(ctx context.Context) (width, height int, err error) {
+	cmd := exec.CommandContext(ctx, "stty", "size") //todo context
+	cmd.Stdin = os.Stdin
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	parts := bytes.Fields(out)
+	if len(parts) != 2 {
+		return 0, 0, fmt.Errorf("unexpected stty output: %s", out)
+	}
+
+	height, err = strconv.Atoi(string(parts[0]))
+	if err != nil {
+		return 0, 0, err
+	}
+
+	width, err = strconv.Atoi(string(parts[1]))
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return width, height, nil
 }
 
-func NewConsoleGame(game *snake.Game) (*ConsoleGame, error) {
-	//todo game box must fit in terminal box
-
-	cg := ConsoleGame{
-		isDone: make(chan struct{}),
-		errs:   make(chan error),
-		game:   game,
+func SetTerminalRowMod() (*unix.Termios, func(), error) {
+	old, err := unix.IoctlGetTermios(unix.Stdin, unix.TCGETS)
+	if err != nil {
+		return nil, nil, fmt.Errorf("cannot get old terminal state: %w", err)
 	}
 
-	return &cg, nil
-}
+	term := *old
+	term.Lflag &^= unix.ICANON | unix.ECHO
 
-func (cg *ConsoleGame) RedirectKeyboardToGame(r io.Reader) {
-	buf := bufio.NewReaderSize(r, unicode.MaxRune)
+	if err = unix.IoctlSetTermios(unix.Stdin, unix.TCSETS, &term); err != nil {
+		return nil, nil, fmt.Errorf("cannot set new terminal state: %w", err)
+	}
 
-	for {
-		key, _, err := buf.ReadRune()
-		if err != nil {
-			cg.errs <- fmt.Errorf("ConsoleGame.RedirectKeyboardToGame: cannot read rune: %w", err)
-			continue
+	rollback := func() {
+		if err = unix.IoctlSetTermios(unix.Stdin, unix.TCSETS, old); err != nil {
+			fmt.Printf("cannot rollback terminal state, please close this terminal session")
 		}
-
-		switch key {
-		case 'w':
-			cg.game.MoveSnake(snake.DirectionUp)
-		case 'd':
-			cg.game.MoveSnake(snake.DirectionRight)
-		case 's':
-			cg.game.MoveSnake(snake.DirectionDown)
-		case 'a':
-			cg.game.MoveSnake(snake.DirectionLeft)
-		case 27: //esc
-			cg.isDone <- struct{}{}
-		}
-
-		buf.Reset(r)
-	}
-}
-
-func (cg *ConsoleGame) DisplayCells(w io.Writer, cells [][]snake.Cell) {
-	var sb strings.Builder
-
-	for _, row := range cells {
-		for _, cell := range row {
-			switch cell {
-			case snake.BorderCell:
-				sb.WriteRune('#')
-			case snake.EmptyCell:
-				sb.WriteRune(' ')
-			case snake.SnakeCell:
-				sb.WriteRune('S')
-			case snake.AppleCell:
-				sb.WriteRune('A')
-			}
-		}
-		sb.WriteRune('\n')
 	}
 
-	if _, err := fmt.Fprint(w, sb.String()); err != nil {
-		cg.errs <- fmt.Errorf("ConsoleGame.DispalyBoard: cannot write cells: %w", err)
-	}
-}
-
-func (cg *ConsoleGame) Start(ctx context.Context) {
-	go cg.game.Start()
-
-	go cg.RedirectKeyboardToGame(os.Stdin)
-
-	go func() {
-		for cells := range cg.game.ConsumeCells() {
-			cg.DisplayCells(os.Stdout, cells)
-		}
-	}()
-
-	select {
-	case <-ctx.Done():
-	case <-cg.game.Done():
-	case <-cg.isDone:
-	}
+	return &term, rollback, nil
 }
